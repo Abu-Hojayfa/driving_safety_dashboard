@@ -1,19 +1,21 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import {
   Activity,
   AlertTriangle,
   Eye,
   Gauge,
   Smartphone,
-  Thermometer,
   AlertCircle,
   CheckCircle,
+  Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface DashboardData {
-  fsr?: number | null;
-  eyeClose?: boolean | null;
+  eyeDrowsy?: boolean | null;
+  steerInactive?: boolean | null;
+  rpm?: string | number | null;
+  rolloverDetected?: boolean | null;
   speed?: number | null;
   serverTime?: number | null;
   [key: string]: any;
@@ -24,8 +26,41 @@ interface HistoricalEntry {
   data: DashboardData;
 }
 
-const API_URL = "https://esp32-server-sage.vercel.app/dashboard";
+// Use environment variable or default to the provided URL
+const API_URL =
+  import.meta.env.VITE_API_URL ||
+  "https://esp32-server-sage.vercel.app/dashboard/stream";
 const MAX_HISTORY_ENTRIES = 50;
+const HISTORY_ADD_INTERVAL = 3000; // Add to history every 3 seconds
+
+// Mock data for testing/fallback
+const MOCK_DATA: DashboardData = {
+  eyeDrowsy: false,
+  steerInactive: false,
+  rpm: "2500",
+  rolloverDetected: false,
+};
+
+// RPM to km/h conversion for 9x9mm DC motor
+// Motor specs: 3-6V DC motor, max ~10,000 RPM
+// Wheel: 6cm radius (12cm diameter)
+// Mechanical efficiency: 70% (30% loss due to friction/resistance)
+//
+// Formula: Speed (km/h) = (RPM × Wheel_Circumference_m × 60) / 1000 × Efficiency
+// Calculation:
+//   - Wheel circumference = π × 0.12m = 0.3768m
+//   - Base conversion = 0.3768 × 60 / 1000 = 0.0226 km/h per RPM
+//   - With 30% waste (70% efficiency): 0.0226 × 0.7 = 0.0158 km/h per RPM
+//
+// At max 10,000 RPM: ~158 km/h (realistic max with efficiency loss)
+// Safe speed threshold: 80 km/h
+const rpmToKmh = (rpm: number | string | null): number | null => {
+  if (rpm === null || rpm === undefined) return null;
+  const rpmNum = typeof rpm === "string" ? parseFloat(rpm) : rpm;
+  if (isNaN(rpmNum)) return null;
+  // Conversion factor: 0.0158 km/h per RPM (with 30% mechanical loss)
+  return Math.round(rpmNum * 0.0158);
+};
 
 export default function Dashboard() {
   const [currentData, setCurrentData] = useState<DashboardData | null>(null);
@@ -33,47 +68,99 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<string>("Never");
+  const [useMockData, setUseMockData] = useState(false);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const lastHistoryAddRef = useRef<number>(0);
+
+  const addToHistory = (data: DashboardData) => {
+    setHistory((prev) => {
+      const updated = [
+        ...prev,
+        {
+          timestamp: Date.now(),
+          data,
+        },
+      ];
+      // Remove oldest entry if exceeds max
+      if (updated.length > MAX_HISTORY_ENTRIES) {
+        updated.shift();
+      }
+      return updated;
+    });
+  };
+
+  const loadData = (data: DashboardData, isMock: boolean = false) => {
+    // Calculate speed from RPM
+    const calculatedSpeed = rpmToKmh(data.rpm);
+    const dataWithSpeed = {
+      ...data,
+      speed: calculatedSpeed,
+    };
+
+    setCurrentData(dataWithSpeed);
+    setError(null);
+    setLastFetched(new Date().toLocaleTimeString());
+    setUseMockData(isMock);
+
+    // Add to history only every 3 seconds (debounce)
+    const now = Date.now();
+    if (now - lastHistoryAddRef.current >= HISTORY_ADD_INTERVAL) {
+      addToHistory(dataWithSpeed);
+      lastHistoryAddRef.current = now;
+    }
+  };
 
   useEffect(() => {
-    const fetchDashboardData = async () => {
+    let isMounted = true;
+
+    const connectSSE = () => {
       try {
-        const response = await fetch(API_URL);
-        if (!response.ok) {
-          throw new Error(`API Error: ${response.status}`);
-        }
-        const data: DashboardData = await response.json();
+        const eventSource = new EventSource(API_URL);
 
-        setCurrentData(data);
-        setError(null);
-        setLastFetched(new Date().toLocaleTimeString());
-
-        // Add to history with timestamp, keep only last 50 entries
-        setHistory((prev) => {
-          const updated = [
-            ...prev,
-            {
-              timestamp: Date.now(),
-              data,
-            },
-          ];
-          // Remove oldest entry if exceeds max
-          if (updated.length > MAX_HISTORY_ENTRIES) {
-            updated.shift();
+        eventSource.onopen = () => {
+          if (isMounted) {
+            setLoading(false);
+            setError(null);
           }
-          return updated;
-        });
+        };
+
+        eventSource.onmessage = (event) => {
+          if (!isMounted) return;
+          try {
+            const data: DashboardData = JSON.parse(event.data);
+            loadData(data, false);
+          } catch (err) {
+            console.error("Failed to parse SSE message:", err);
+          }
+        };
+
+        eventSource.onerror = () => {
+          if (isMounted) {
+            eventSource.close();
+            setError("Connection lost to real-time data stream");
+            setLoading(false);
+          }
+        };
+
+        eventSourceRef.current = eventSource;
       } catch (err) {
-        const errorMessage =
-          err instanceof Error ? err.message : "Failed to fetch data";
-        setError(errorMessage);
-        console.error("Dashboard fetch error:", err);
-      } finally {
-        setLoading(false);
+        if (isMounted) {
+          const errorMessage =
+            err instanceof Error ? err.message : "Failed to connect to API";
+          setError(errorMessage);
+          setLoading(false);
+        }
       }
     };
 
-    // Initial fetch only - API calls itself every 5 seconds from server side
-    fetchDashboardData();
+    connectSSE();
+
+    return () => {
+      isMounted = false;
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
+    };
   }, []);
 
   const getSafeValue = (value: any, fallback: string = "N/A") => {
@@ -108,8 +195,6 @@ export default function Dashboard() {
       danger: "border-red-200 bg-red-50",
     };
 
-  
-
     return (
       <div
         className={cn(
@@ -131,19 +216,38 @@ export default function Dashboard() {
     );
   };
 
-  if (error && currentData === null && history.length === 0) {
+  if (error && currentData === null && history.length === 0 && !useMockData) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center p-4">
-        <div className="max-w-md w-full bg-white rounded-lg p-8 text-center">
+        <div className="max-w-md w-full bg-slate-800 rounded-lg p-8 text-center border border-slate-700">
           <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
-          <h2 className="text-2xl font-bold text-slate-900 mb-2">
-            Connection Error
+          <h2 className="text-2xl font-bold text-white mb-2">
+            Real-Time Stream Unavailable
           </h2>
-          <p className="text-slate-600 mb-4">
-            Unable to connect to the vehicle system. Please ensure the ESP32
-            device is online and try again.
+          <p className="text-slate-300 mb-4">
+            Unable to connect to the real-time data stream. This could mean:
           </p>
-          <p className="text-sm text-slate-500">{error}</p>
+          <ul className="text-sm text-slate-400 mb-6 text-left space-y-2 bg-slate-900/50 p-4 rounded">
+            <li>• The ESP32 server is offline or unreachable</li>
+            <li>• The SSE endpoint is not configured</li>
+            <li>• Network connectivity issues</li>
+          </ul>
+          <p className="text-sm text-red-400 mb-6 font-mono break-all">
+            {API_URL}
+          </p>
+          <p className="text-sm text-slate-400 mb-6">{error}</p>
+          <button
+            onClick={() => {
+              setLoading(false);
+              loadData(MOCK_DATA, true);
+            }}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition-colors mb-3"
+          >
+            Use Demo Data
+          </button>
+          <p className="text-xs text-slate-500">
+            Ensure the server is running SSE on the /dashboard/stream endpoint.
+          </p>
         </div>
       </div>
     );
@@ -175,15 +279,20 @@ export default function Dashboard() {
                 <div
                   className={cn(
                     "w-2 h-2 rounded-full animate-pulse",
-                    error ? "bg-red-500" : "bg-green-500"
+                    error && !useMockData ? "bg-red-500" : useMockData ? "bg-yellow-500" : "bg-green-500"
                   )}
                 />
                 <span className="text-sm text-slate-400">
-                  {error ? "Offline" : "Live"}
+                  {error && !useMockData
+                    ? "Stream Offline"
+                    : useMockData
+                      ? "Demo Mode"
+                      : "Streaming Live"}
                 </span>
               </div>
               <p className="text-xs sm:text-sm text-slate-500">
                 Last update: {lastFetched}
+                {useMockData && " (demo data)"}
               </p>
             </div>
           </div>
@@ -201,7 +310,7 @@ export default function Dashboard() {
 
           {loading && history.length === 0 ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
-              {[1, 2, 3, 4, 5, 6].map((i) => (
+              {[1, 2, 3, 4].map((i) => (
                 <div
                   key={i}
                   className="h-32 bg-slate-700 rounded-lg animate-pulse"
@@ -210,6 +319,7 @@ export default function Dashboard() {
             </div>
           ) : currentData ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
+              {/* Vehicle Speed */}
               <DataCard
                 icon={<Gauge className="w-6 h-6" />}
                 label="Vehicle Speed"
@@ -218,65 +328,86 @@ export default function Dashboard() {
                 status={
                   typeof currentData.speed === "number" &&
                   currentData.speed > 120
-                    ? "warning"
+                    ? "danger"
                     : typeof currentData.speed === "number" &&
-                        currentData.speed > 150
-                      ? "danger"
+                        currentData.speed > 80
+                      ? "warning"
                       : "safe"
                 }
               />
 
+              {/* Driver Drowsiness */}
               <DataCard
                 icon={<Eye className="w-6 h-6" />}
-                label="Driver Alertness"
+                label="Driver Drowsiness"
                 value={
-                  currentData.eyeClose === null ||
-                  currentData.eyeClose === undefined
+                  currentData.eyeDrowsy === null ||
+                  currentData.eyeDrowsy === undefined
                     ? "Unknown"
-                    : currentData.eyeClose
-                      ? "Eyes Closed"
+                    : currentData.eyeDrowsy
+                      ? "Drowsy"
                       : "Alert"
                 }
                 status={
-                  currentData.eyeClose === true
+                  currentData.eyeDrowsy === true
                     ? "danger"
-                    : currentData.eyeClose === false
+                    : currentData.eyeDrowsy === false
                       ? "safe"
                       : undefined
                 }
               />
 
+              {/* Steering Activity */}
               <DataCard
-                icon={<Thermometer className="w-6 h-6" />}
-                label="Force Sensor Reading"
-                value={currentData.fsr ?? "N/A"}
-                unit={typeof currentData.fsr === "number" ? "units" : ""}
+                icon={<Activity className="w-6 h-6" />}
+                label="Steering Status"
+                value={
+                  currentData.steerInactive === null ||
+                  currentData.steerInactive === undefined
+                    ? "Unknown"
+                    : currentData.steerInactive
+                      ? "Inactive"
+                      : "Active"
+                }
                 status={
-                  typeof currentData.fsr === "number" &&
-                  currentData.fsr > 800
+                  currentData.steerInactive === true
                     ? "warning"
-                    : "safe"
+                    : currentData.steerInactive === false
+                      ? "safe"
+                      : undefined
                 }
               />
 
-              {/* Display additional data fields */}
-              {Object.entries(currentData).map(([key, value]) => {
-                if (
-                  !["fsr", "eyeClose", "speed", "serverTime"].includes(key) &&
-                  value !== null &&
-                  value !== undefined
-                ) {
-                  return (
-                    <DataCard
-                      key={key}
-                      icon={<AlertTriangle className="w-6 h-6" />}
-                      label={key.charAt(0).toUpperCase() + key.slice(1)}
-                      value={getSafeValue(value)}
-                    />
-                  );
+              {/* Rollover Detection */}
+              <DataCard
+                icon={<AlertTriangle className="w-6 h-6" />}
+                label="Rollover Detection"
+                value={
+                  currentData.rolloverDetected === null ||
+                  currentData.rolloverDetected === undefined
+                    ? "Unknown"
+                    : currentData.rolloverDetected
+                      ? "Detected"
+                      : "Normal"
                 }
-                return null;
-              })}
+                status={
+                  currentData.rolloverDetected === true
+                    ? "danger"
+                    : currentData.rolloverDetected === false
+                      ? "safe"
+                      : undefined
+                }
+              />
+
+              {/* RPM Display */}
+              {currentData.rpm !== null && currentData.rpm !== undefined && (
+                <DataCard
+                  icon={<Zap className="w-6 h-6" />}
+                  label="Engine RPM"
+                  value={currentData.rpm}
+                  unit="RPM"
+                />
+              )}
             </div>
           ) : (
             <div className="bg-slate-700/30 border border-slate-600 rounded-lg p-8 text-center">
@@ -300,7 +431,7 @@ export default function Dashboard() {
                   key={idx}
                   className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 sm:p-4 hover:bg-slate-800 transition-colors"
                 >
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                     <p className="text-xs sm:text-sm text-slate-400 font-mono">
                       {formatTime(entry.timestamp)}
                     </p>
@@ -308,28 +439,42 @@ export default function Dashboard() {
                       {entry.data.speed !== null &&
                         entry.data.speed !== undefined && (
                           <span className="bg-blue-900/50 text-blue-200 px-2 py-1 rounded">
-                            Speed: {entry.data.speed}
+                            Speed: {entry.data.speed} km/h
                           </span>
                         )}
-                      {entry.data.eyeClose !== null &&
-                        entry.data.eyeClose !== undefined && (
+                      {entry.data.eyeDrowsy !== null &&
+                        entry.data.eyeDrowsy !== undefined && (
                           <span
                             className={cn(
                               "px-2 py-1 rounded",
-                              entry.data.eyeClose
+                              entry.data.eyeDrowsy
                                 ? "bg-red-900/50 text-red-200"
                                 : "bg-green-900/50 text-green-200"
                             )}
                           >
-                            Eyes: {entry.data.eyeClose ? "Closed" : "Open"}
+                            {entry.data.eyeDrowsy ? "Drowsy" : "Alert"}
                           </span>
                         )}
-                      {entry.data.fsr !== null &&
-                        entry.data.fsr !== undefined && (
-                          <span className="bg-purple-900/50 text-purple-200 px-2 py-1 rounded">
-                            FSR: {entry.data.fsr}
+                      {entry.data.steerInactive !== null &&
+                        entry.data.steerInactive !== undefined && (
+                          <span
+                            className={cn(
+                              "px-2 py-1 rounded",
+                              entry.data.steerInactive
+                                ? "bg-yellow-900/50 text-yellow-200"
+                                : "bg-green-900/50 text-green-200"
+                            )}
+                          >
+                            {entry.data.steerInactive
+                              ? "Steering Inactive"
+                              : "Steering Active"}
                           </span>
                         )}
+                      {entry.data.rolloverDetected === true && (
+                        <span className="bg-red-900/50 text-red-200 px-2 py-1 rounded font-semibold">
+                          ⚠️ Rollover!
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -343,9 +488,9 @@ export default function Dashboard() {
       <footer className="border-t border-slate-700 bg-slate-900/50 mt-8 sm:mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
           <div className="text-center text-sm text-slate-400">
-            <p>Vehicle Safety Monitoring System • Real-time Data Feed</p>
+            <p>Vehicle Safety Monitoring System • Real-time Data Stream</p>
             <p className="mt-2 text-xs text-slate-500">
-              Keeping last 50 entries • Updates every 5 seconds (server-side polling)
+              Live updates every 500ms • Historical data recorded every 3 seconds • Last 50 entries kept
             </p>
           </div>
         </div>
