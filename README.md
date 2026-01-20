@@ -2,6 +2,9 @@
 
 A real-time vehicle safety monitoring system that displays live telemetry data with intelligent fallback handling and historical data tracking.
 
+🔗 **Live Dashboard:** [https://car-safety-dashboard.netlify.app/](https://car-safety-dashboard.netlify.app/)  
+🔗 **Backend Server Repository:** [https://github.com/Abu-Hojayfa/esp32-server](https://github.com/Abu-Hojayfa/esp32-server)
+
 ## Features
 
 - **Real-time Data Monitoring**: Live updates from vehicle sensors (speed, drowsiness detection, steering status, rollover detection, engine RPM)
